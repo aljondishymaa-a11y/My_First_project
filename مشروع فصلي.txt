@@ -1,0 +1,1352 @@
+"""
+نظام اكتشاف الثغرات الأمنية الذاتي التعلم
+مشروع تخرج متقدم - إلغاء التدخل البشري بالكامل
+"""
+
+# ====================== المكتبات الأساسية ======================
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Categorical, Normal
+import gym
+from gym import spaces
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import deque
+import random
+from datetime import datetime
+import json
+import pickle
+import os
+import warnings
+import hashlib
+import logging
+import sys
+import time
+from tqdm import tqdm
+import shutil
+import csv
+
+warnings.filterwarnings('ignore')
+
+# ====================== إعدادات النظام المتقدمة ======================
+class SystemConfig:
+    def __init__(self):
+        # إعدادات التعلم
+        self.learning_rate = 0.001
+        self.gamma = 0.99
+        self.tau = 0.005
+        
+        # إعدادات الذاكرة
+        self.memory_size = 100000
+        self.batch_size = 128
+        
+        # إعدادات الشبكة
+        self.hidden_size = 256
+        self.num_actions = 12
+        
+        # إعدادات التدريب
+        self.max_episodes = 2000
+        self.max_steps = 200
+        self.update_every = 50
+        self.save_every = 100
+        
+        # إعدادات التكيف
+        self.epsilon_start = 1.0
+        self.epsilon_end = 0.01
+        self.epsilon_decay = 0.995
+        
+        # إنشاء المجلدات
+        self.create_folders()
+    
+    def create_folders(self):
+        folders = ['models', 'data', 'logs', 'reports', 'backups']
+        for folder in folders:
+            os.makedirs(folder, exist_ok=True)
+
+# ====================== توليد البيانات الذاتي ======================
+class DataGenerator:
+    def __init__(self):
+        self.vulnerabilities = {
+            'SQL Injection': {'severity': 9, 'complexity': 7, 'patterns': ['SELECT', 'UNION', 'OR 1=1']},
+            'XSS': {'severity': 7, 'complexity': 6, 'patterns': ['<script>', 'alert', 'onload']},
+            'RCE': {'severity': 10, 'complexity': 9, 'patterns': ['system(', 'exec(', 'eval(']},
+            'LFI': {'severity': 8, 'complexity': 6, 'patterns': ['../', 'etc/passwd', 'include']},
+            'SSRF': {'severity': 8, 'complexity': 7, 'patterns': ['localhost', '127.0.0.1', 'internal']}
+        }
+        
+        self.systems = {
+            'Web Server': {'ports': [80, 443, 8080], 'services': ['Apache', 'Nginx', 'IIS']},
+            'Database': {'ports': [3306, 5432, 27017], 'services': ['MySQL', 'PostgreSQL', 'MongoDB']},
+            'Application': {'ports': [3000, 5000, 8000], 'services': ['Node.js', 'Python', 'Java']},
+            'File Server': {'ports': [21, 22, 445], 'services': ['FTP', 'SSH', 'SMB']},
+            'Mail Server': {'ports': [25, 110, 143], 'services': ['SMTP', 'POP3', 'IMAP']}
+        }
+        
+        self.patterns_learned = []
+        
+    def generate_system(self):
+        system_type = random.choice(list(self.systems.keys()))
+        system_info = self.systems[system_type]
+        
+        # توليد عدد عشوائي من المنافذ المفتوحة
+        num_ports = random.randint(2, len(system_info['ports']))
+        open_ports = random.sample(system_info['ports'], num_ports)
+        
+        # توليد خدمات
+        services = random.sample(system_info['services'], random.randint(1, len(system_info['services'])))
+        
+        # تحديد وجود ثغرة
+        has_vulnerability = random.random() > 0.3
+        
+        vulnerability = None
+        vulnerability_type = None
+        vulnerability_details = None
+        
+        if has_vulnerability:
+            vulnerability_type = random.choice(list(self.vulnerabilities.keys()))
+            vulnerability = self.vulnerabilities[vulnerability_type]
+            
+            # إنشاء تفاصيل الثغرة
+            vulnerability_details = {
+                'type': vulnerability_type,
+                'severity': vulnerability['severity'],
+                'complexity': vulnerability['complexity'],
+                'pattern': random.choice(vulnerability['patterns']),
+                'port': random.choice(open_ports) if open_ports else 80,
+                'exploitable': random.random() > 0.4
+            }
+        
+        system = {
+            'id': f"SYS_{random.randint(1000, 9999)}",
+            'type': system_type,
+            'open_ports': open_ports,
+            'services': services,
+            'os': random.choice(['Linux', 'Windows', 'macOS']),
+            'has_vulnerability': has_vulnerability,
+            'vulnerability': vulnerability_details,
+            'security_level': random.randint(1, 10),
+            'firewall': random.random() > 0.5,
+            'ids': random.random() > 0.7
+        }
+        
+        return system
+    
+    def generate_dataset(self, num_samples=1000):
+        dataset = []
+        
+        for i in range(num_samples):
+            system = self.generate_system()
+            dataset.append(system)
+            
+            # تعلم الأنماط
+            if system['has_vulnerability']:
+                pattern = {
+                    'system_type': system['type'],
+                    'vulnerability': system['vulnerability']['type'],
+                    'port': system['vulnerability']['port'],
+                    'service': random.choice(system['services'])
+                }
+                self.patterns_learned.append(pattern)
+        
+        return dataset
+    
+    def save_patterns(self, filename='data/patterns.json'):
+        with open(filename, 'w') as f:
+            json.dump(self.patterns_learned, f, indent=2)
+    
+    def load_patterns(self, filename='data/patterns.json'):
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                self.patterns_learned = json.load(f)
+
+# ====================== بيئة التعلم المعزز ======================
+class VulnerabilityEnv(gym.Env):
+    def __init__(self, data_generator):
+        super(VulnerabilityEnv, self).__init__()
+        
+        self.data_generator = data_generator
+        self.current_system = None
+        self.steps_taken = 0
+        self.discovered_ports = []
+        self.discovered_services = []
+        self.found_vulnerabilities = []
+        self.access_level = 0  # 0: لا يوجد وصول، 1: وصول جزئي، 2: وصول كامل
+        
+        # تعريف مساحة الحالة
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(20,), dtype=np.float32
+        )
+        
+        # تعريف مساحة الإجراءات
+        self.action_space = spaces.Discrete(12)
+        
+        self.action_descriptions = [
+            "مسح المنافذ السريع",
+            "مسح المنافذ العميق",
+            "فحص الخدمات",
+            "اختبار SQL Injection",
+            "اختبار XSS",
+            "اختبار RCE",
+            "اختبار LFI",
+            "اختبار SSRF",
+            "استغلال الثغرة",
+            "تصعيد الصلاحيات",
+            "تثبيت وصول",
+            "المحافظة على التخفي"
+        ]
+        
+        self.reset()
+    
+    def reset(self):
+        self.current_system = self.data_generator.generate_system()
+        self.steps_taken = 0
+        self.discovered_ports = []
+        self.discovered_services = []
+        self.found_vulnerabilities = []
+        self.access_level = 0
+        
+        return self._get_state()
+    
+    def _get_state(self):
+        state = np.zeros(20, dtype=np.float32)
+        
+        # نظام التشغيل (one-hot encoding)
+        os_types = ['Linux', 'Windows', 'macOS']
+        if self.current_system['os'] in os_types:
+            state[os_types.index(self.current_system['os'])] = 1.0
+        
+        # نوع النظام (one-hot encoding)
+        system_types = list(self.data_generator.systems.keys())
+        if self.current_system['type'] in system_types:
+            state[3 + system_types.index(self.current_system['type'])] = 1.0
+        
+        # نسبة الاكتشاف
+        if self.current_system['open_ports']:
+            state[8] = len(self.discovered_ports) / len(self.current_system['open_ports'])
+        
+        if self.current_system['services']:
+            state[9] = len(self.discovered_services) / len(self.current_system['services'])
+        
+        # مستوى الأمان
+        state[10] = self.current_system['security_level'] / 10.0
+        
+        # وجود جدار ناري
+        state[11] = 1.0 if self.current_system['firewall'] else 0.0
+        
+        # وجود نظام كشف
+        state[12] = 1.0 if self.current_system['ids'] else 0.0
+        
+        # مستوى الوصول
+        state[13] = self.access_level / 2.0
+        
+        # عدد الخطوات
+        state[14] = self.steps_taken / 50.0
+        
+        # وجود ثغرة
+        state[15] = 1.0 if self.current_system['has_vulnerability'] else 0.0
+        
+        # عدد الثغرات المكتشفة
+        state[16] = len(self.found_vulnerabilities) / 3.0
+        
+        # تعقيد النظام
+        complexity = len(self.current_system['open_ports']) * 0.1
+        complexity += len(self.current_system['services']) * 0.1
+        state[17] = min(1.0, complexity)
+        
+        # القيم العشوائية (لإضافة تنوع)
+        state[18] = random.random()
+        state[19] = random.random()
+        
+        return state
+    
+    def step(self, action):
+        self.steps_taken += 1
+        reward = 0
+        done = False
+        info = {'action': self.action_descriptions[action]}
+        
+        # تنفيذ الإجراء
+        if action == 0:  # مسح المنافذ السريع
+            reward = self._fast_scan()
+        elif action == 1:  # مسح المنافذ العميق
+            reward = self._deep_scan()
+        elif action == 2:  # فحص الخدمات
+            reward = self._service_scan()
+        elif action in [3, 4, 5, 6, 7]:  # اختبارات الثغرات
+            vuln_type = ['SQL Injection', 'XSS', 'RCE', 'LFI', 'SSRF'][action-3]
+            reward = self._test_vulnerability(vuln_type)
+        elif action == 8:  # استغلال الثغرة
+            reward = self._exploit_vulnerability()
+        elif action == 9:  # تصعيد الصلاحيات
+            reward = self._escalate_privileges()
+        elif action == 10:  # تثبيت وصول
+            reward = self._establish_access()
+        elif action == 11:  # المحافظة على التخفي
+            reward = self._maintain_stealth()
+        
+        # عقوبة الوقت
+        reward -= 0.01
+        
+        # التحقق من انتهاء الحلقة
+        if self.steps_taken >= 50:
+            done = True
+            # مكافأة إضافية للإنجازات
+            if len(self.found_vulnerabilities) > 0:
+                reward += 1.0
+            if self.access_level == 2:
+                reward += 2.0
+        
+        # تحديث المعلومات
+        info['reward'] = reward
+        info['steps'] = self.steps_taken
+        info['access_level'] = self.access_level
+        info['vulnerabilities_found'] = len(self.found_vulnerabilities)
+        
+        return self._get_state(), reward, done, info
+    
+    def _fast_scan(self):
+        reward = 0
+        common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3389]
+        
+        for port in common_ports:
+            if port in self.current_system['open_ports'] and port not in self.discovered_ports:
+                self.discovered_ports.append(port)
+                reward += 0.1
+        
+        return reward
+    
+    def _deep_scan(self):
+        reward = 0
+        
+        for port in self.current_system['open_ports']:
+            if port not in self.discovered_ports:
+                self.discovered_ports.append(port)
+                reward += 0.05
+        
+        return reward
+    
+    def _service_scan(self):
+        reward = 0
+        
+        if len(self.discovered_ports) > 0:
+            for service in self.current_system['services']:
+                if service not in self.discovered_services:
+                    self.discovered_services.append(service)
+                    reward += 0.2
+        
+        return reward
+    
+    def _test_vulnerability(self, vuln_type):
+        reward = 0
+        
+        if self.current_system['has_vulnerability']:
+            if self.current_system['vulnerability']['type'] == vuln_type:
+                if vuln_type not in self.found_vulnerabilities:
+                    self.found_vulnerabilities.append(vuln_type)
+                    reward += 1.0
+            else:
+                reward -= 0.1  # عقوبة لاختبار خاطئ
+        
+        return reward
+    
+    def _exploit_vulnerability(self):
+        reward = 0
+        
+        if len(self.found_vulnerabilities) > 0:
+            if self.current_system['vulnerability']['exploitable']:
+                self.access_level = 1
+                reward += 2.0
+            else:
+                reward -= 0.5
+        
+        return reward
+    
+    def _escalate_privileges(self):
+        reward = 0
+        
+        if self.access_level == 1:
+            if random.random() > 0.5:  # 50% فرصة للنجاح
+                self.access_level = 2
+                reward += 3.0
+            else:
+                reward -= 1.0
+        
+        return reward
+    
+    def _establish_access(self):
+        reward = 0
+        
+        if self.access_level == 2:
+            reward += 1.0  # مكافأة إضافية لتثبيت الوصول
+        
+        return reward
+    
+    def _maintain_stealth(self):
+        reward = 0
+        
+        # تقليل فرصة الاكتشاف
+        if random.random() > 0.8:  # 20% فرصة للاكتشاف
+            reward += 0.5
+        
+        return reward
+    
+    def render(self, mode='human'):
+        print(f"\n=== نظام: {self.current_system['id']} ===")
+        print(f"نوع النظام: {self.current_system['type']}")
+        print(f"نظام التشغيل: {self.current_system['os']}")
+        print(f"مستوى الأمان: {self.current_system['security_level']}/10")
+        print(f"جدار ناري: {'نعم' if self.current_system['firewall'] else 'لا'}")
+        print(f"نظام كشف: {'نعم' if self.current_system['ids'] else 'لا'}")
+        print(f"المنافذ المفتوحة: {self.current_system['open_ports']}")
+        print(f"الخدمات: {self.current_system['services']}")
+        print(f"يحتوي على ثغرات: {'نعم' if self.current_system['has_vulnerability'] else 'لا'}")
+        
+        if self.current_system['has_vulnerability']:
+            print(f"نوع الثغرة: {self.current_system['vulnerability']['type']}")
+            print(f"شدة الثغرة: {self.current_system['vulnerability']['severity']}/10")
+        
+        print(f"\n=== التقدم ===")
+        print(f"الخطوات: {self.steps_taken}")
+        print(f"المنافذ المكتشفة: {self.discovered_ports}")
+        print(f"الخدمات المكتشفة: {self.discovered_services}")
+        print(f"الثغرات المكتشفة: {self.found_vulnerabilities}")
+        print(f"مستوى الوصول: {self.access_level}/2")
+        print("="*50)
+
+# ====================== الشبكات العصبية ======================
+class ActorNetwork(nn.Module):
+    def __init__(self, state_size, action_size, hidden_size=256):
+        super(ActorNetwork, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, action_size),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, state):
+        return self.network(state)
+
+class CriticNetwork(nn.Module):
+    def __init__(self, state_size, hidden_size=256):
+        super(CriticNetwork, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+    
+    def forward(self, state):
+        return self.network(state)
+
+# ====================== الذاكرة ======================
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        if len(self.memory) < batch_size:
+            return None
+        
+        batch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        return (
+            torch.FloatTensor(states),
+            torch.LongTensor(actions),
+            torch.FloatTensor(rewards),
+            torch.FloatTensor(next_states),
+            torch.FloatTensor(dones)
+        )
+    
+    def __len__(self):
+        return len(self.memory)
+
+# ====================== وكيل التعلم المعزز ======================
+class RLAgent:
+    def __init__(self, state_size, action_size, config):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.config = config
+        
+        # الشبكات
+        self.actor = ActorNetwork(state_size, action_size, config.hidden_size)
+        self.critic = CriticNetwork(state_size, config.hidden_size)
+        
+        # المثيلات المستهدفة
+        self.target_actor = ActorNetwork(state_size, action_size, config.hidden_size)
+        self.target_critic = CriticNetwork(state_size, config.hidden_size)
+        
+        # نسخ الأوزان
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        
+        # المحسنات
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.learning_rate)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.learning_rate)
+        
+        # الذاكرة
+        self.memory = ReplayMemory(config.memory_size)
+        
+        # إحصائيات
+        self.epsilon = config.epsilon_start
+        self.steps = 0
+        self.episodes = 0
+        
+        # نقل للنظام إذا كان متاحاً
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.actor.to(self.device)
+        self.critic.to(self.device)
+        self.target_actor.to(self.device)
+        self.target_critic.to(self.device)
+    
+    def select_action(self, state, training=True):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        
+        if training and random.random() < self.epsilon:
+            # استكشاف عشوائي
+            action = random.randrange(self.action_size)
+        else:
+            # استغلال
+            with torch.no_grad():
+                action_probs = self.actor(state_tensor)
+                action_dist = Categorical(action_probs)
+                action = action_dist.sample().item()
+        
+        # تخفيض إبسيلون
+        if training:
+            self.epsilon = max(self.config.epsilon_end, 
+                             self.epsilon * self.config.epsilon_decay)
+        
+        return action
+    
+    def learn(self):
+        if len(self.memory) < self.config.batch_size:
+            return 0, 0
+        
+        # أخذ عينة من الذاكرة
+        batch = self.memory.sample(self.config.batch_size)
+        if batch is None:
+            return 0, 0
+        
+        states, actions, rewards, next_states, dones = batch
+        
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+        
+        # حساب قيم Q المستهدفة
+        with torch.no_grad():
+            next_action_probs = self.target_actor(next_states)
+            next_action_dist = Categorical(next_action_probs)
+            next_actions = next_action_dist.sample()
+            next_q_values = self.target_critic(next_states).squeeze()
+            
+            target_q_values = rewards + self.config.gamma * next_q_values * (1 - dones)
+        
+        # تحديث الناقد
+        current_q_values = self.critic(states).squeeze()
+        critic_loss = F.mse_loss(current_q_values, target_q_values)
+        
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optimizer.step()
+        
+        # تحديث الممثل
+        action_probs = self.actor(states)
+        action_dist = Categorical(action_probs)
+        action_log_probs = action_dist.log_prob(actions)
+        
+        actor_loss = -torch.mean(action_log_probs * (target_q_values - current_q_values.detach()))
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        self.actor_optimizer.step()
+        
+        # تحديث الشبكات المستهدفة
+        self._soft_update(self.target_actor, self.actor, self.config.tau)
+        self._soft_update(self.target_critic, self.critic, self.config.tau)
+        
+        return actor_loss.item(), critic_loss.item()
+    
+    def _soft_update(self, target, source, tau):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+    
+    def save_model(self, path):
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'steps': self.steps,
+            'episodes': self.episodes
+        }, path)
+    
+    def load_model(self, path):
+        checkpoint = torch.load(path)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.epsilon = checkpoint['epsilon']
+        self.steps = checkpoint['steps']
+        self.episodes = checkpoint['episodes']
+        
+        # تحديث الشبكات المستهدفة
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+
+# ====================== النظام الذاتي التعلم ======================
+class AutonomousLearningSystem:
+    def __init__(self):
+        self.config = SystemConfig()
+        self.data_generator = DataGenerator()
+        self.env = VulnerabilityEnv(self.data_generator)
+        
+        state_size = self.env.observation_space.shape[0]
+        action_size = self.env.action_space.n
+        
+        self.agent = RLAgent(state_size, action_size, self.config)
+        
+        # إحصائيات التدريب
+        self.training_stats = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'losses': [],
+            'epsilon_values': [],
+            'success_rate': []
+        }
+        
+        # إنشاء سجل
+        self.setup_logging()
+    
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('logs/training.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def train(self, num_episodes=None):
+        if num_episodes is None:
+            num_episodes = self.config.max_episodes
+        
+        self.logger.info(f"بدء التدريب لـ {num_episodes} حلقة")
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            episode_loss = 0
+            steps = 0
+            
+            for step in range(self.config.max_steps):
+                # اختيار إجراء
+                action = self.agent.select_action(state, training=True)
+                
+                # تنفيذ الإجراء
+                next_state, reward, done, info = self.env.step(action)
+                
+                # حفظ الخبرة
+                self.agent.memory.push(state, action, reward, next_state, done)
+                
+                # التعلم
+                actor_loss, critic_loss = self.agent.learn()
+                if actor_loss > 0:
+                    episode_loss += actor_loss + critic_loss
+                
+                # تحديث الحالة
+                state = next_state
+                episode_reward += reward
+                steps += 1
+                self.agent.steps += 1
+                
+                if done:
+                    break
+            
+            # تحديث الإحصائيات
+            self.training_stats['episode_rewards'].append(episode_reward)
+            self.training_stats['episode_lengths'].append(steps)
+            self.training_stats['epsilon_values'].append(self.agent.epsilon)
+            self.training_stats['losses'].append(episode_loss / max(steps, 1))
+            
+            # حساب معدل النجاح
+            success = 1 if episode_reward > 10 else 0
+            if len(self.training_stats['success_rate']) < 10:
+                self.training_stats['success_rate'].append(success)
+            else:
+                self.training_stats['success_rate'].pop(0)
+                self.training_stats['success_rate'].append(success)
+            
+            self.agent.episodes += 1
+            
+            # عرض التقدم
+            if (episode + 1) % 10 == 0:
+                avg_reward = np.mean(self.training_stats['episode_rewards'][-10:])
+                avg_steps = np.mean(self.training_stats['episode_lengths'][-10:])
+                success_rate = np.mean(self.training_stats['success_rate']) * 100
+                
+                self.logger.info(
+                    f"الحلقة {episode + 1:4d} | "
+                    f"متوسط المكافأة: {avg_reward:6.2f} | "
+                    f"متوسط الخطوات: {avg_steps:5.1f} | "
+                    f"معدل النجاح: {success_rate:5.1f}% | "
+                    f"إبسيلون: {self.agent.epsilon:.3f}"
+                )
+            
+            # حفظ النموذج
+            if (episode + 1) % self.config.save_every == 0:
+                model_path = f"models/agent_episode_{episode + 1}.pth"
+                self.agent.save_model(model_path)
+                self.data_generator.save_patterns()
+                self.save_training_stats()
+                
+                self.logger.info(f"تم حفظ النموذج في {model_path}")
+        
+        # حفظ النموذج النهائي
+        final_path = "models/agent_final.pth"
+        self.agent.save_model(final_path)
+        self.data_generator.save_patterns()
+        self.save_training_stats()
+        self.plot_training_results()
+        
+        self.logger.info(f"اكتمل التدريب! تم حفظ النموذج النهائي في {final_path}")
+    
+    def test(self, num_episodes=100, render=False):
+        self.logger.info(f"بدء الاختبار لـ {num_episodes} حلقة")
+        
+        test_stats = {
+            'rewards': [],
+            'steps': [],
+            'vulnerabilities_found': [],
+            'access_levels': [],
+            'successful_episodes': 0
+        }
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            steps = 0
+            max_access = 0
+            vulnerabilities_found = 0
+            
+            for step in range(self.config.max_steps):
+                # اختيار إجراء (بدون استكشاف)
+                action = self.agent.select_action(state, training=False)
+                
+                # تنفيذ الإجراء
+                next_state, reward, done, info = self.env.step(action)
+                
+                # تحديث الإحصائيات
+                episode_reward += reward
+                steps += 1
+                max_access = max(max_access, info['access_level'])
+                vulnerabilities_found = max(vulnerabilities_found, info['vulnerabilities_found'])
+                
+                if render:
+                    self.env.render()
+                    print(f"الإجراء: {info['action']}")
+                    print(f"المكافأة: {reward:.2f}")
+                    time.sleep(0.1)
+                
+                if done:
+                    break
+            
+            # تحديث إحصائيات الاختبار
+            test_stats['rewards'].append(episode_reward)
+            test_stats['steps'].append(steps)
+            test_stats['vulnerabilities_found'].append(vulnerabilities_found)
+            test_stats['access_levels'].append(max_access)
+            
+            if episode_reward > 15:  # عتبة النجاح
+                test_stats['successful_episodes'] += 1
+        
+        # عرض نتائج الاختبار
+        print("\n" + "="*60)
+        print("نتائج الاختبار")
+        print("="*60)
+        print(f"عدد الحلقات: {num_episodes}")
+        print(f"متوسط المكافأة: {np.mean(test_stats['rewards']):.2f}")
+        print(f"متوسط الخطوات: {np.mean(test_stats['steps']):.2f}")
+        print(f"متوسط الثغرات المكتشفة: {np.mean(test_stats['vulnerabilities_found']):.2f}")
+        print(f"متوسط مستوى الوصول: {np.mean(test_stats['access_levels']):.2f}")
+        print(f"الحلقات الناجحة: {test_stats['successful_episodes']} ({test_stats['successful_episodes']/num_episodes*100:.1f}%)")
+        print("="*60)
+        
+        # حفظ نتائج الاختبار
+        with open('reports/test_results.txt', 'w') as f:
+            f.write("نتائج اختبار النظام الذاتي التعلم\n")
+            f.write("="*50 + "\n")
+            f.write(f"التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"عدد الحلقات: {num_episodes}\n")
+            f.write(f"متوسط المكافأة: {np.mean(test_stats['rewards']):.2f}\n")
+            f.write(f"متوسط الخطوات: {np.mean(test_stats['steps']):.2f}\n")
+            f.write(f"متوسط الثغرات: {np.mean(test_stats['vulnerabilities_found']):.2f}\n")
+            f.write(f"معدل النجاح: {test_stats['successful_episodes']/num_episodes*100:.1f}%\n")
+        
+        return test_stats
+    
+    def save_training_stats(self):
+        stats = {
+            'training_stats': self.training_stats,
+            'config': self.config.__dict__,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        with open('data/training_stats.pkl', 'wb') as f:
+            pickle.dump(stats, f)
+    
+    def load_training_stats(self):
+        if os.path.exists('data/training_stats.pkl'):
+            with open('data/training_stats.pkl', 'rb') as f:
+                stats = pickle.load(f)
+                self.training_stats = stats['training_stats']
+    
+    def plot_training_results(self):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # المكافآت
+        axes[0, 0].plot(self.training_stats['episode_rewards'])
+        axes[0, 0].set_title('المكافآت في كل حلقة')
+        axes[0, 0].set_xlabel('الحلقة')
+        axes[0, 0].set_ylabel('المكافأة')
+        axes[0, 0].grid(True)
+        
+        # متوسط متحرك للمكافآت
+        window = 50
+        if len(self.training_stats['episode_rewards']) >= window:
+            moving_avg = np.convolve(self.training_stats['episode_rewards'], 
+                                    np.ones(window)/window, mode='valid')
+            axes[0, 1].plot(moving_avg)
+            axes[0, 1].set_title(f'متوسط متحرك للمكافآت (نافذة {window})')
+            axes[0, 1].set_xlabel('الحلقة')
+            axes[0, 1].set_ylabel('متوسط المكافأة')
+            axes[0, 1].grid(True)
+        
+        # طول الحلقات
+        axes[0, 2].plot(self.training_stats['episode_lengths'])
+        axes[0, 2].set_title('طول الحلقات')
+        axes[0, 2].set_xlabel('الحلقة')
+        axes[0, 2].set_ylabel('عدد الخطوات')
+        axes[0, 2].grid(True)
+        
+        # الخسائر
+        axes[1, 0].plot(self.training_stats['losses'])
+        axes[1, 0].set_title('الخسائر')
+        axes[1, 0].set_xlabel('الحلقة')
+        axes[1, 0].set_ylabel('الخسارة')
+        axes[1, 0].grid(True)
+        
+        # إبسيلون
+        axes[1, 1].plot(self.training_stats['epsilon_values'])
+        axes[1, 1].set_title('قيمة إبسيلون')
+        axes[1, 1].set_xlabel('الحلقة')
+        axes[1, 1].set_ylabel('إبسيلون')
+        axes[1, 1].grid(True)
+        
+        # معدل النجاح
+        if self.training_stats['success_rate']:
+            success_rates = []
+            for i in range(len(self.training_stats['success_rate'])):
+                if i >= 9:
+                    avg = np.mean(self.training_stats['success_rate'][i-9:i+1]) * 100
+                    success_rates.append(avg)
+            
+            axes[1, 2].plot(success_rates)
+            axes[1, 2].set_title('معدل النجاح')
+            axes[1, 2].set_xlabel('الحلقة')
+            axes[1, 2].set_ylabel('معدل النجاح (%)')
+            axes[1, 2].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('reports/training_results.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+# ====================== واجهة المستخدم ======================
+class UserInterface:
+    def __init__(self):
+        self.system = None
+        self.model_loaded = False
+    
+    def show_menu(self):
+        print("\n" + "="*60)
+        print("نظام اكتشاف الثغرات الأمنية الذاتي التعلم")
+        print("="*60)
+        print("1. تدريب النظام من الصفر")
+        print("2. استئناف التدريب")
+        print("3. اختبار النموذج المدرب")
+        print("4. عرض توضيحي للنظام")
+        print("5. تحليل البيانات والإحصائيات")
+        print("6. إنشاء نسخة احتياطية")
+        print("7. تحميل نموذج مدرب")
+        print("8. الخروج")
+        print("="*60)
+    
+    def run(self):
+        while True:
+            self.show_menu()
+            choice = input("\nاختر رقم الخيار: ").strip()
+            
+            try:
+                if choice == '1':
+                    self.train_from_scratch()
+                elif choice == '2':
+                    self.resume_training()
+                elif choice == '3':
+                    self.test_model()
+                elif choice == '4':
+                    self.run_demo()
+                elif choice == '5':
+                    self.analyze_data()
+                elif choice == '6':
+                    self.create_backup()
+                elif choice == '7':
+                    self.load_model()
+                elif choice == '8':
+                    print("\nشكراً لاستخدام النظام الذاتي التعلم!")
+                    break
+                else:
+                    print("⚠️ خيار غير صحيح، يرجى المحاولة مرة أخرى")
+            except KeyboardInterrupt:
+                print("\n\nتم إيقاف النظام من قبل المستخدم")
+                break
+            except Exception as e:
+                print(f"\n❌ حدث خطأ: {str(e)}")
+                print("يرجى المحاولة مرة أخرى")
+    
+    def train_from_scratch(self):
+        print("\n🎯 بدء التدريب من الصفر")
+        episodes = input("عدد حلقات التدريب (افتراضي: 1000): ").strip()
+        
+        try:
+            num_episodes = int(episodes) if episodes else 1000
+        except:
+            num_episodes = 1000
+        
+        confirm = input(f"\nهل تريد بدء التدريب لـ {num_episodes} حلقة؟ (نعم/لا): ").strip().lower()
+        
+        if confirm in ['نعم', 'yes', 'y', '1']:
+            self.system = AutonomousLearningSystem()
+            print(f"\n⏳ بدء التدريب لـ {num_episodes} حلقة...")
+            print("قد يستغرق هذا بعض الوقت...")
+            
+            start_time = time.time()
+            self.system.train(num_episodes)
+            end_time = time.time()
+            
+            duration = end_time - start_time
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            seconds = int(duration % 60)
+            
+            print(f"\n✅ اكتمل التدريب في {hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.model_loaded = True
+        else:
+            print("❌ تم إلغاء التدريب")
+    
+    def resume_training(self):
+        model_path = input("\nمسار النموذج للاستئناف (افتراضي: models/agent_final.pth): ").strip()
+        if not model_path:
+            model_path = "models/agent_final.pth"
+        
+        if not os.path.exists(model_path):
+            print(f"❌ ملف النموذج غير موجود: {model_path}")
+            return
+        
+        episodes = input("عدد حلقات التدريب الإضافية (افتراضي: 500): ").strip()
+        
+        try:
+            num_episodes = int(episodes) if episodes else 500
+        except:
+            num_episodes = 500
+        
+        confirm = input(f"\nهل تريد استئناف التدريب لـ {num_episodes} حلقة إضافية؟ (نعم/لا): ").strip().lower()
+        
+        if confirm in ['نعم', 'yes', 'y', '1']:
+            self.system = AutonomousLearningSystem()
+            
+            # تحميل النموذج
+            if os.path.exists(model_path):
+                self.system.agent.load_model(model_path)
+                self.system.load_training_stats()
+                print(f"✅ تم تحميل النموذج من {model_path}")
+            
+            print(f"\n⏳ استئناف التدريب لـ {num_episodes} حلقة إضافية...")
+            
+            start_time = time.time()
+            self.system.train(num_episodes)
+            end_time = time.time()
+            
+            duration = end_time - start_time
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            seconds = int(duration % 60)
+            
+            print(f"\n✅ اكتمل التدريب في {hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.model_loaded = True
+        else:
+            print("❌ تم إلغاء التدريب")
+    
+    def test_model(self):
+        if not self.model_loaded:
+            self.load_model()
+            if not self.model_loaded:
+                return
+        
+        episodes = input("\nعدد حلقات الاختبار (افتراضي: 100): ").strip()
+        
+        try:
+            num_episodes = int(episodes) if episodes else 100
+        except:
+            num_episodes = 100
+        
+        render = input("هل تريد مشاهدة التفاصيل أثناء الاختبار؟ (نعم/لا): ").strip().lower()
+        render_mode = render in ['نعم', 'yes', 'y', '1']
+        
+        print(f"\n🔬 بدء اختبار النموذج لـ {num_episodes} حلقة...")
+        
+        start_time = time.time()
+        results = self.system.test(num_episodes, render_mode)
+        end_time = time.time()
+        
+        duration = end_time - start_time
+        minutes = int(duration // 60)
+        seconds = int(duration % 60)
+        
+        print(f"\n⏱️  وقت الاختبار: {minutes:02d}:{seconds:02d}")
+        
+        # عرض المزيد من الإحصائيات
+        if results:
+            print("\n📊 إحصائيات مفصلة:")
+            print(f"  أعلى مكافأة: {np.max(results['rewards']):.2f}")
+            print(f"  أقل مكافأة: {np.min(results['rewards']):.2f}")
+            print(f"  انحراف معياري: {np.std(results['rewards']):.2f}")
+            print(f"  أعلى مستوى وصول: {np.max(results['access_levels'])}")
+            print(f"  أكثر عدد ثغرات: {np.max(results['vulnerabilities_found'])}")
+    
+    def run_demo(self):
+        print("\n🎮 بدء العرض التوضيحي")
+        print("سيعرض النظام 5 حلقات من التفاعل مع الأنظمة")
+        
+        if not self.model_loaded:
+            print("⚠️ جاري تحميل نموذج افتراضي...")
+            self.system = AutonomousLearningSystem()
+            self.model_loaded = True
+        
+        for demo_num in range(5):
+            print(f"\n{'='*60}")
+            print(f"العرض التوضيحي {demo_num + 1}/5")
+            print(f"{'='*60}")
+            
+            state = self.system.env.reset()
+            total_reward = 0
+            step = 0
+            
+            self.system.env.render()
+            
+            for _ in range(20):  # 20 خطوة كحد أقصى للعرض
+                action = self.system.agent.select_action(state, training=False)
+                next_state, reward, done, info = self.system.env.step(action)
+                
+                print(f"\nالخطوة {step + 1}:")
+                print(f"  الإجراء: {info['action']}")
+                print(f"  المكافأة: {reward:.2f}")
+                print(f"  الثغرات المكتشفة: {info['vulnerabilities_found']}")
+                print(f"  مستوى الوصول: {info['access_level']}")
+                
+                state = next_state
+                total_reward += reward
+                step += 1
+                
+                time.sleep(0.5)
+                
+                if done:
+                    break
+            
+            print(f"\nنتيجة العرض التوضيحي {demo_num + 1}:")
+            print(f"  المكافأة الإجمالية: {total_reward:.2f}")
+            print(f"  عدد الخطوات: {step}")
+            
+            if demo_num < 4:
+                input("\n↵ اضغط Enter للمتابعة إلى العرض التالي...")
+        
+        print(f"\n{'='*60}")
+        print("انتهى العرض التوضيحي!")
+        print(f"{'='*60}")
+    
+    def analyze_data(self):
+        print("\n📈 تحليل بيانات النظام")
+        
+        # تحقق من وجود البيانات
+        data_files = []
+        if os.path.exists('data/training_stats.pkl'):
+            data_files.append('إحصائيات التدريب')
+        if os.path.exists('data/patterns.json'):
+            data_files.append('أنماط التعلم')
+        if os.path.exists('reports/test_results.txt'):
+            data_files.append('نتائج الاختبار')
+        if os.path.exists('logs/training.log'):
+            data_files.append('سجل التدريب')
+        
+        if not data_files:
+            print("❌ لا توجد بيانات للتحليل")
+            return
+        
+        print("البيانات المتاحة:")
+        for i, file in enumerate(data_files, 1):
+            print(f"  {i}. {file}")
+        
+        try:
+            choice = input("\nاختر نوع البيانات للتحليل (رقم): ").strip()
+            choice = int(choice) - 1
+            
+            if choice < 0 or choice >= len(data_files):
+                print("❌ اختيار غير صحيح")
+                return
+            
+            selected_file = data_files[choice]
+            
+            if selected_file == 'إحصائيات التدريب':
+                self.analyze_training_stats()
+            elif selected_file == 'أنماط التعلم':
+                self.analyze_patterns()
+            elif selected_file == 'نتائج الاختبار':
+                self.analyze_test_results()
+            elif selected_file == 'سجل التدريب':
+                self.analyze_training_log()
+        
+        except ValueError:
+            print("❌ يرجى إدخال رقم صحيح")
+    
+    def analyze_training_stats(self):
+        if not os.path.exists('data/training_stats.pkl'):
+            print("❌ ملف إحصائيات التدريب غير موجود")
+            return
+        
+        with open('data/training_stats.pkl', 'rb') as f:
+            stats = pickle.load(f)
+        
+        training_stats = stats['training_stats']
+        
+        print("\n📊 تحليل إحصائيات التدريب:")
+        print(f"  عدد الحلقات: {len(training_stats['episode_rewards'])}")
+        print(f"  متوسط المكافأة: {np.mean(training_stats['episode_rewards']):.2f}")
+        print(f"  أفضل مكافأة: {np.max(training_stats['episode_rewards']):.2f}")
+        print(f"  متوسط طول الحلقة: {np.mean(training_stats['episode_lengths']):.2f}")
+        
+        # عرض الرسم البياني إذا كان النظام متاحاً
+        if self.system:
+            self.system.plot_training_results()
+        else:
+            print("⚠️ يتطلب تحميل النظام لعرض الرسوم البيانية")
+    
+    def analyze_patterns(self):
+        if not os.path.exists('data/patterns.json'):
+            print("❌ ملف الأنماط غير موجود")
+            return
+        
+        with open('data/patterns.json', 'r') as f:
+            patterns = json.load(f)
+        
+        print(f"\n📚 تحليل الأنماط المكتسبة:")
+        print(f"  عدد الأنماط: {len(patterns)}")
+        
+        if patterns:
+            # تحليل توزيع الأنظمة
+            system_counts = {}
+            vulnerability_counts = {}
+            
+            for pattern in patterns:
+                system = pattern['system_type']
+                vuln = pattern['vulnerability']
+                
+                system_counts[system] = system_counts.get(system, 0) + 1
+                vulnerability_counts[vuln] = vulnerability_counts.get(vuln, 0) + 1
+            
+            print(f"\n  توزيع الأنظمة:")
+            for system, count in system_counts.items():
+                percentage = (count / len(patterns)) * 100
+                print(f"    • {system}: {count} ({percentage:.1f}%)")
+            
+            print(f"\n  توزيع الثغرات:")
+            for vuln, count in vulnerability_counts.items():
+                percentage = (count / len(patterns)) * 100
+                print(f"    • {vuln}: {count} ({percentage:.1f}%)")
+    
+    def analyze_test_results(self):
+        if not os.path.exists('reports/test_results.txt'):
+            print("❌ ملف نتائج الاختبار غير موجود")
+            return
+        
+        with open('reports/test_results.txt', 'r') as f:
+            content = f.read()
+        
+        print("\n📋 نتائج الاختبار:")
+        print(content)
+    
+    def analyze_training_log(self):
+        if not os.path.exists('logs/training.log'):
+            print("❌ ملف سجل التدريب غير موجود")
+            return
+        
+        with open('logs/training.log', 'r') as f:
+            lines = f.readlines()
+        
+        if not lines:
+            print("❌ سجل التدريب فارغ")
+            return
+        
+        print(f"\n📝 آخر 10 سجلات للتدريب:")
+        for line in lines[-10:]:
+            print(f"  {line.strip()}")
+    
+    def create_backup(self):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_dir = f"backups/backup_{timestamp}"
+        
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        # نسخ الملفات المهمة
+        folders_to_backup = ['models', 'data', 'logs', 'reports']
+        
+        print(f"\n💾 إنشاء نسخة احتياطية في: {backup_dir}")
+        
+        for folder in folders_to_backup:
+            if os.path.exists(folder):
+                dest_folder = os.path.join(backup_dir, folder)
+                shutil.copytree(folder, dest_folder)
+                print(f"  ✅ تم نسخ: {folder}")
+        
+        # إنشاء ملف معلومات النسخة الاحتياطية
+        info = {
+            'timestamp': timestamp,
+            'date': datetime.now().isoformat(),
+            'folders_backed_up': folders_to_backup,
+            'system': 'Autonomous Vulnerability Detection System'
+        }
+        
+        with open(os.path.join(backup_dir, 'backup_info.json'), 'w') as f:
+            json.dump(info, f, indent=2)
+        
+        print(f"\n✅ اكتملت النسخة الاحتياطية: {backup_dir}")
+    
+    def load_model(self):
+        model_path = input("\nمسار النموذج للتحميل (افتراضي: models/agent_final.pth): ").strip()
+        if not model_path:
+            model_path = "models/agent_final.pth"
+        
+        if not os.path.exists(model_path):
+            print(f"❌ ملف النموذج غير موجود: {model_path}")
+            
+            # عرض النماذج المتاحة
+            model_files = [f for f in os.listdir('models') if f.endswith('.pth')]
+            if model_files:
+                print("\nالنماذج المتاحة:")
+                for i, file in enumerate(model_files, 1):
+                    print(f"  {i}. {file}")
+                
+                try:
+                    choice = input("\nاختر رقم النموذج للتحميل: ").strip()
+                    choice = int(choice) - 1
+                    
+                    if 0 <= choice < len(model_files):
+                        model_path = os.path.join('models', model_files[choice])
+                    else:
+                        print("❌ اختيار غير صحيح")
+                        return
+                except ValueError:
+                    print("❌ يرجى إدخال رقم صحيح")
+                    return
+            else:
+                print("❌ لا توجد نماذج متاحة")
+                return
+        
+        try:
+            self.system = AutonomousLearningSystem()
+            self.system.agent.load_model(model_path)
+            self.system.load_training_stats()
+            
+            print(f"✅ تم تحميل النموذج بنجاح من {model_path}")
+            print(f"   الحلقات المدربة: {self.system.agent.episodes}")
+            print(f"   الخطوات الكلية: {self.system.agent.steps}")
+            print(f"   قيمة إبسيلون: {self.system.agent.epsilon:.3f}")
+            
+            self.model_loaded = True
+        
+        except Exception as e:
+            print(f"❌ خطأ في تحميل النموذج: {str(e)}")
+            self.model_loaded = False
+
+# ====================== الدالة الرئيسية ======================
+def main():
+    print("\n" + "="*70)
+    print("🚀 نظام اكتشاف الثغرات الأمنية الذاتي التعلم")
+    print("🎓 مشروع تخرج متقدم - الإصدار 1.0")
+    print("📅 تم التطوير: " + datetime.now().strftime("%Y-%m-%d"))
+    print("="*70)
+    
+    # التحقق من المكتبات المطلوبة
+    try:
+        import torch
+        import gym
+        import numpy as np
+        import pandas as pd
+        
+        print("✅ جميع المكتبات المطلوبة مثبتة")
+        
+        # عرض معلومات النظام
+        print(f"\n💻 معلومات النظام:")
+        print(f"  نظام التشغيل: {sys.platform}")
+        print(f"  إصدار Python: {sys.version[:6]}")
+        print(f"  PyTorch: {torch.__version__}")
+        print(f"  CUDA متاحة: {torch.cuda.is_available()}")
+        
+        if torch.cuda.is_available():
+            print(f"  جهاز GPU: {torch.cuda.get_device_name(0)}")
+    
+    except ImportError as e:
+        print(f"❌ مكتبة مفقودة: {e}")
+        print("يرجى تثبيت المكتبات المطلوبة باستخدام:")
+        print("pip install torch gym numpy pandas matplotlib seaborn")
+        return
+    
+    # بدء واجهة المستخدم
+    ui = UserInterface()
+    ui.run()
+
+# ====================== تشغيل النظام ======================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nتم إيقاف النظام من قبل المستخدم")
+    except Exception as e:
+        print(f"\n❌ حدث خطأ غير متوقع: {str(e)}")
+        print("يرجى التحقق من الإعدادات والمكتبات")
+    finally:
+        print("\n" + "="*70)
+        print("شكراً لاستخدام نظام اكتشاف الثغرات الذاتي التعلم")
+        print("="*70)
